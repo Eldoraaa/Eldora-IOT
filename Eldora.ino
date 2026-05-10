@@ -1,401 +1,661 @@
-// ==========================================
-// ELDORA CARE — ESP32 Firmware
-// Versi baru tanpa LLM/STT/TTS/Audio
-// Animasi LCD dari ABot.ino tetap dipertahankan
-// ==========================================
-
 #include <SPI.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
-#include <DHT.h>
-#include <LovyanGFX.hpp>
+#include <WebServer.h>
+#include <ESPmDNS.h>
 #include <ArduinoJson.h>
-#include <math.h>
+#include <Preferences.h>
+#include <esp_system.h>
+#include <LovyanGFX.hpp>
 #include "images_data.h"
 
-// ==========================================
-// 1. KONFIGURASI
-// ==========================================
-const char* PRODUCT_NAME  = "ELDORA_CARE";
-const char* WIFI_SSID     = "YOUR_SSID";
-const char* WIFI_PASS     = "YOUR_PASSWORD";
-const char* BACKEND_URL   = "http://192.168.1.100:3000";  // IP server lokal
-const char* DEVICE_KEY    = "YOUR_DEVICE_KEY_FROM_SEED";  // dari output seed
 
-// Pin TFT (identik dengan ABot.ino)
-#define TFT_SCK   12
-#define TFT_MOSI  11
-#define TFT_CS    10
-#define TFT_DC    9
-#define TFT_RST   8
-#define TFT_BL    14
+struct EldoraConfig {
+  const char* productName;
+  const char* backendUrl;
+  const char* deviceKey;
+  const char* firmwareVersion;
+};
 
-// Sensor & Tombol
-#define DHT_PIN   4
-#define BTN_PIN   1
+const EldoraConfig CONFIG = {
+  "ELDORA_CARE",
+  "https://eldora-backend-production.up.railway.app",
+  "ELDORA-HUB-001",
+  "0.4.0",
+};
 
-// Timing (ms)
-#define HEARTBEAT_INTERVAL_MS  30000UL   // 30 detik
-#define DHT_INTERVAL_MS        10000UL   // 10 detik
-#define SUCCESS_DISPLAY_MS     2000UL    // tampil success/error 2 detik
-#define DOUBLE_PRESS_WINDOW    400UL     // jendela deteksi double press
-#define LONG_PRESS_THRESHOLD   3000UL    // 3 detik = emergency
-#define DHT_ANOMALY_COOLDOWN   300000UL  // 5 menit cooldown per anomaly
+// TFT pins.
+#define TFT_SCK 12
+#define TFT_MOSI 11
+#define TFT_CS 10
+#define TFT_DC 9
+#define TFT_RST 8
+#define TFT_BL 14
 
-// Retry
-#define MAX_RETRIES     3
-#define RETRY_BASE_MS   1000UL
+// Timers.
+#define HEARTBEAT_INTERVAL_MS 30000UL
+#define COMMAND_POLL_INTERVAL_MS 15000UL
+#define DISPLAY_INTERVAL_MS 500UL
+#define WIFI_CONNECT_TIMEOUT_MS 20000UL
 
-// Threshold anomali
-#define TEMP_HIGH_THRESHOLD    35.0f
-#define TEMP_LOW_THRESHOLD     18.0f
-#define HUM_HIGH_THRESHOLD     90.0f
+// Persistent hub settings.
+#define PREF_NAMESPACE "eldora"
+#define PREF_WIFI_SSID "wifi_ssid"
+#define PREF_WIFI_PASS "wifi_pass"
+#define PREF_PAIR_TOKEN "pair_token"
 
-// ==========================================
-// 2. STATE MACHINE
-// ==========================================
-enum State { IDLE, SENDING, SUCCESS, ERROR_STATE };
-State currentState = IDLE;
-State lastState    = IDLE;
+// Set this to an ADC pin after adding a voltage divider circuit.
+#define BATTERY_ADC_PIN -1
+#define BATTERY_EMPTY_MV 3300
+#define BATTERY_FULL_MV 4200
 
-unsigned long stateChangeTime = 0;
+enum HubState { BOOTING, PROVISIONING, WIFI_CONNECTING, ONLINE, APPLYING_WIFI, ERROR_STATE };
+HubState currentState = BOOTING;
 
-void setState(State s) {
-  if (s != currentState) {
-    const char* names[] = { "IDLE", "SENDING", "SUCCESS", "ERROR" };
-    Serial.printf("[%lu] [STATE] %s -> %s\n", millis(), names[currentState], names[s]);
-    currentState    = s;
-    stateChangeTime = millis();
-  }
-}
-
-// ==========================================
-// 3. HARDWARE — TFT (identik dengan ABot.ino)
-// ==========================================
 class LGFX_ESP32S3 : public lgfx::LGFX_Device {
   lgfx::Panel_ILI9488 _panel;
-  lgfx::Bus_SPI       _bus;
+  lgfx::Bus_SPI _bus;
+
 public:
   LGFX_ESP32S3() {
-    auto cfg_b = _bus.config();
-    cfg_b.spi_host  = SPI2_HOST;
-    cfg_b.pin_sclk  = TFT_SCK;
-    cfg_b.pin_mosi  = TFT_MOSI;
-    cfg_b.pin_miso  = -1;
-    cfg_b.pin_dc    = TFT_DC;
-    cfg_b.freq_write = 15000000;
-    _bus.config(cfg_b);
+    auto busConfig = _bus.config();
+    busConfig.spi_host = SPI2_HOST;
+    busConfig.pin_sclk = TFT_SCK;
+    busConfig.pin_mosi = TFT_MOSI;
+    busConfig.pin_miso = -1;
+    busConfig.pin_dc = TFT_DC;
+    busConfig.freq_write = 15000000;
+    _bus.config(busConfig);
     _panel.setBus(&_bus);
 
-    auto cfg_p = _panel.config();
-    cfg_p.pin_cs     = TFT_CS;
-    cfg_p.pin_rst    = TFT_RST;
-    cfg_p.panel_width  = 320;
-    cfg_p.panel_height = 480;
-    cfg_p.rgb_order    = true;
-    _panel.config(cfg_p);
+    auto panelConfig = _panel.config();
+    panelConfig.pin_cs = TFT_CS;
+    panelConfig.pin_rst = TFT_RST;
+    panelConfig.panel_width = 320;
+    panelConfig.panel_height = 480;
+    panelConfig.rgb_order = true;
+    _panel.config(panelConfig);
     setPanel(&_panel);
   }
 };
+
 LGFX_ESP32S3 tft;
+Preferences preferences;
+WebServer provisioningServer(80);
 
-DHT dht(DHT_PIN, DHT11);
+String activeWifiSsid;
+String activeWifiPass;
+String pendingWifiSsid;
+String pendingWifiPass;
+String localPairingToken;
+bool provisioningMode = false;
+bool shouldApplyProvisionedWifi = false;
+bool localServerStarted = false;
+bool mdnsStarted = false;
 
-// ==========================================
-// 4. ANIMASI VISUALIZER
-// ==========================================
-// Bar positions — identik dengan kode lama ABot.ino
-// Diaktifkan dengan animasi sintetis (tanpa mikrofon)
-void drawVisualizer() {
-  const int base_x    = 180;
-  const int base_y    = 300;
-  const int bar_width = 15;
-  const int spacing   = 10;
-  const int max_h     = 60;
+String compactDeviceCode() {
+  String code = CONFIG.deviceKey;
+  code.replace("-", "");
+  if (code.length() <= 6) return code;
+  return code.substring(code.length() - 6);
+}
 
-  if (currentState == IDLE || currentState == ERROR_STATE) {
-    // Bersihkan semua bar
-    for (int i = 0; i < 5; i++) {
-      int x_pos = base_x + (i * (bar_width + spacing));
-      tft.fillRect(x_pos, base_y - max_h, bar_width, max_h, TFT_BLACK);
-    }
-    return;
-  }
+String provisioningSsid() {
+  return String("ELDORA-SETUP-") + compactDeviceCode();
+}
 
-  // Animasi sintetis menggunakan gelombang sinus
-  for (int i = 0; i < 5; i++) {
-    float phase       = millis() / 200.0f + i * 0.8f;
-    int   synth_vol   = (int)((sinf(phase) + 1.0f) * 5000.0f);  // 0–10000
-    int   h           = map(synth_vol, 0, 10000, 5, max_h);
-    h                 = constrain(h, 5, max_h);
-    int x_pos         = base_x + (i * (bar_width + spacing));
+String provisioningPassword() {
+  String code = compactDeviceCode();
+  if (code.length() <= 3) return String("eldora") + code;
+  return String("eldora") + code.substring(code.length() - 3);
+}
 
-    tft.fillRect(x_pos, base_y - h,     bar_width, h,          lgfx::color565(0, 255 - (i * 30), 255));
-    tft.fillRect(x_pos, base_y - max_h, bar_width, max_h - h,  TFT_BLACK);
+String generatePairingToken() {
+  char token[25];
+  snprintf(
+    token,
+    sizeof(token),
+    "%08lX%08lX%08lX",
+    (unsigned long)esp_random(),
+    (unsigned long)esp_random(),
+    (unsigned long)esp_random()
+  );
+  return String(token);
+}
+
+void loadPairingToken() {
+  localPairingToken = preferences.getString(PREF_PAIR_TOKEN, "");
+  if (localPairingToken.length() >= 8) return;
+
+  localPairingToken = generatePairingToken();
+  preferences.putString(PREF_PAIR_TOKEN, localPairingToken);
+  Serial.println("[PAIR] Local pairing token generated");
+}
+
+const char* stateLabel() {
+  switch (currentState) {
+    case BOOTING:
+      return "Booting";
+    case PROVISIONING:
+      return "Setup WiFi";
+    case WIFI_CONNECTING:
+      return "Connecting";
+    case ONLINE:
+      return "Online";
+    case APPLYING_WIFI:
+      return "WiFi Setup";
+    case ERROR_STATE:
+      return "Needs Check";
+    default:
+      return "Unknown";
   }
 }
 
-// ==========================================
-// 5. HTTP — Kirim Event ke Backend
-// ==========================================
-bool sendEventToBackend(const char* eventType, String detail) {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[HTTP] WiFi tidak terhubung — event dibatalkan");
+uint16_t stateColor() {
+  switch (currentState) {
+    case ONLINE:
+      return lgfx::color565(80, 190, 135);
+    case PROVISIONING:
+      return lgfx::color565(123, 167, 212);
+    case APPLYING_WIFI:
+      return lgfx::color565(90, 150, 230);
+    case ERROR_STATE:
+      return lgfx::color565(235, 95, 95);
+    default:
+      return lgfx::color565(255, 138, 122);
+  }
+}
+
+const uint8_t* currentFrame() {
+  if (currentState == ONLINE) return img_speak;
+  if (currentState == PROVISIONING || currentState == WIFI_CONNECTING || currentState == APPLYING_WIFI) return img_listen;
+  return img_idle;
+}
+
+void drawFrameBitmap(const uint8_t* frame, int x, int y, int scale, uint16_t color) {
+  for (int row = 0; row < ELDORA_FRAME_HEIGHT; row++) {
+    for (int col = 0; col < ELDORA_FRAME_WIDTH; col++) {
+      int byteIndex = row * (ELDORA_FRAME_WIDTH / 8) + (col / 8);
+      uint8_t byteValue = pgm_read_byte(&frame[byteIndex]);
+      bool isOn = byteValue & (0x80 >> (col % 8));
+      if (isOn) {
+        tft.fillRoundRect(x + col * scale, y + row * scale, scale - 1, scale - 1, 2, color);
+      }
+    }
+  }
+}
+
+void renderDisplay() {
+  static HubState lastState = BOOTING;
+  static unsigned long lastRender = 0;
+
+  if (lastState == currentState && millis() - lastRender < DISPLAY_INTERVAL_MS) {
+    return;
+  }
+
+  lastState = currentState;
+  lastRender = millis();
+
+  tft.fillScreen(lgfx::color565(234, 245, 251));
+  tft.fillCircle(240, 115, 52, stateColor());
+  tft.fillCircle(240, 115, 34, lgfx::color565(16, 24, 39));
+  drawFrameBitmap(currentFrame(), 192, 67, 6, TFT_WHITE);
+
+  tft.setTextDatum(middle_center);
+  tft.setTextColor(lgfx::color565(31, 42, 55));
+  tft.setTextSize(3);
+  tft.drawString("ELDORA", 240, 200);
+
+  tft.setTextColor(lgfx::color565(92, 113, 132));
+  tft.setTextSize(2);
+  tft.drawString(stateLabel(), 240, 242);
+
+  tft.setTextSize(1);
+  if (currentState == PROVISIONING) {
+    tft.drawString(provisioningSsid(), 240, 278);
+    tft.drawString(String("Pass: ") + provisioningPassword(), 240, 302);
+    tft.drawString("Open 192.168.4.1", 240, 326);
+  } else {
+    tft.drawString(WiFi.status() == WL_CONNECTED ? WiFi.SSID() : "No WiFi", 240, 280);
+    tft.drawString(String("Key: ") + String(CONFIG.deviceKey).substring(0, 8) + "...", 240, 305);
+  }
+}
+
+int readBatteryLevel() {
+  if (BATTERY_ADC_PIN < 0) return -1;
+
+  int raw = analogRead(BATTERY_ADC_PIN);
+  int mv = map(raw, 0, 4095, 0, 5000);
+  int percent = map(mv, BATTERY_EMPTY_MV, BATTERY_FULL_MV, 0, 100);
+  return constrain(percent, 0, 100);
+}
+
+void loadWifiCredentials() {
+  activeWifiSsid = preferences.getString(PREF_WIFI_SSID, "");
+  activeWifiPass = preferences.getString(PREF_WIFI_PASS, "");
+
+  Serial.printf(
+    "[WIFI] Active SSID: %s\n",
+    activeWifiSsid.length() > 0 ? activeWifiSsid.c_str() : "(not configured)"
+  );
+}
+
+bool hasWifiCredentials() {
+  return preferences.isKey(PREF_WIFI_SSID) && preferences.getString(PREF_WIFI_SSID, "").length() > 0;
+}
+
+void saveWifiCredentials(const String& ssid, const String& password) {
+  preferences.putString(PREF_WIFI_SSID, ssid);
+  preferences.putString(PREF_WIFI_PASS, password);
+
+  activeWifiSsid = ssid;
+  activeWifiPass = password;
+  Serial.printf("[WIFI] Saved SSID: %s\n", activeWifiSsid.c_str());
+}
+
+void startMdns() {
+  if (mdnsStarted || WiFi.status() != WL_CONNECTED) return;
+
+  if (MDNS.begin("eldora-hub-001")) {
+    MDNS.addService("http", "tcp", 80);
+    mdnsStarted = true;
+    Serial.println("[MDNS] eldora-hub-001.local");
+  }
+}
+
+void ensureLocalServer();
+
+bool connectToWifi(String ssid, String password, unsigned long timeoutMs) {
+  if (ssid.length() == 0) {
+    Serial.println("[WIFI] SSID is empty");
+    currentState = ERROR_STATE;
+    renderDisplay();
     return false;
   }
 
-  setState(SENDING);
+  currentState = WIFI_CONNECTING;
+  renderDisplay();
 
-  for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    if (attempt > 0) {
-      unsigned long delayMs = RETRY_BASE_MS * (1UL << (attempt - 1));  // 1s, 2s, 4s
-      Serial.printf("[HTTP] Retry %d/%d dalam %lu ms\n", attempt, MAX_RETRIES - 1, delayMs);
-      delay(delayMs);
-    }
+  WiFi.disconnect();
+  delay(300);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid.c_str(), password.c_str());
 
-    String url = String(BACKEND_URL) + "/iot/events";
-    WiFiClient client;
-    HTTPClient http;
+  Serial.printf("[WIFI] Connecting to %s", ssid.c_str());
+  unsigned long startedAt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < timeoutMs) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
 
-    if (!http.begin(client, url)) {
-      Serial.println("[HTTP] Gagal begin");
-      http.end();
-      continue;
-    }
-
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("X-Device-Key", DEVICE_KEY);
-    http.setTimeout(10000);
-
-    StaticJsonDocument<256> doc;
-    doc["eventType"] = eventType;
-    doc["payload"]["detail"] = detail;
-    String body;
-    serializeJson(doc, body);
-
-    int code = http.POST(body);
-    http.end();
-
-    if (code == 200 || code == 201) {
-      Serial.printf("[HTTP] Event '%s' OK (attempt %d). HTTP %d\n", eventType, attempt + 1, code);
-      setState(SUCCESS);
-      return true;
-    }
-    Serial.printf("[HTTP] Event '%s' GAGAL (attempt %d). HTTP %d\n", eventType, attempt + 1, code);
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("[WIFI] Connected: %s\n", WiFi.localIP().toString().c_str());
+    currentState = ONLINE;
+    ensureLocalServer();
+    startMdns();
+    renderDisplay();
+    return true;
   }
 
-  setState(ERROR_STATE);
+  Serial.println("[WIFI] Connection failed");
+  currentState = ERROR_STATE;
+  renderDisplay();
   return false;
+}
+
+void sendCorsHeaders() {
+  provisioningServer.sendHeader("Access-Control-Allow-Origin", "*");
+  provisioningServer.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  provisioningServer.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+template <typename TDocument>
+void sendJson(int statusCode, TDocument& doc) {
+  String response;
+  serializeJson(doc, response);
+  sendCorsHeaders();
+  provisioningServer.send(statusCode, "application/json", response);
+}
+
+void handleProvisioningInfo() {
+  StaticJsonDocument<384> doc;
+  doc["productName"] = CONFIG.productName;
+  doc["deviceKey"] = CONFIG.deviceKey;
+  doc["pairingToken"] = localPairingToken;
+  doc["firmwareVersion"] = CONFIG.firmwareVersion;
+  doc["setupSsid"] = provisioningSsid();
+  doc["setupIp"] = "192.168.4.1";
+  doc["hasWifi"] = hasWifiCredentials();
+  doc["wifiSsid"] = WiFi.status() == WL_CONNECTED ? WiFi.SSID() : "";
+  doc["localIp"] = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "192.168.4.1";
+  int batteryLevel = readBatteryLevel();
+  if (batteryLevel >= 0) doc["batteryLevel"] = batteryLevel;
+  doc["isCharging"] = false;
+  sendJson(200, doc);
+}
+
+void handleProvisioningOptions() {
+  sendCorsHeaders();
+  provisioningServer.send(204);
+}
+
+bool wifiNetworkAlreadyAdded(JsonArray networks, const String& ssid) {
+  for (JsonObject network : networks) {
+    const char* existingSsid = network["ssid"];
+    if (existingSsid && ssid == existingSsid) return true;
+  }
+
+  return false;
+}
+
+void handleWifiScan() {
+  StaticJsonDocument<4096> doc;
+  JsonArray networks = doc.createNestedArray("networks");
+
+  int scanCount = WiFi.scanNetworks(false, true);
+  int added = 0;
+
+  if (scanCount > 0) {
+    for (int i = 0; i < scanCount && added < 15; i++) {
+      String ssid = WiFi.SSID(i);
+      ssid.trim();
+      if (ssid.length() == 0) continue;
+      if (wifiNetworkAlreadyAdded(networks, ssid)) continue;
+
+      JsonObject network = networks.createNestedObject();
+      network["ssid"] = ssid;
+      network["rssi"] = WiFi.RSSI(i);
+      network["secure"] = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+      network["channel"] = WiFi.channel(i);
+      added++;
+    }
+  }
+
+  doc["success"] = true;
+  doc["count"] = added;
+  WiFi.scanDelete();
+  sendJson(200, doc);
+}
+
+void handleProvisionWifi() {
+  String ssid;
+  String password;
+
+  if (provisioningServer.hasArg("plain")) {
+    StaticJsonDocument<256> doc;
+    DeserializationError error = deserializeJson(doc, provisioningServer.arg("plain"));
+    if (!error) {
+      ssid = doc["ssid"] | "";
+      password = doc["password"] | "";
+    }
+  } else {
+    ssid = provisioningServer.arg("ssid");
+    password = provisioningServer.arg("password");
+  }
+
+  ssid.trim();
+  if (ssid.length() == 0) {
+    StaticJsonDocument<128> doc;
+    doc["success"] = false;
+    doc["message"] = "SSID is required";
+    sendJson(400, doc);
+    return;
+  }
+
+  pendingWifiSsid = ssid;
+  pendingWifiPass = password;
+  shouldApplyProvisionedWifi = true;
+
+  StaticJsonDocument<192> doc;
+  doc["success"] = true;
+  doc["message"] = "WiFi received, hub is connecting";
+  doc["ssid"] = ssid;
+  sendJson(200, doc);
+}
+
+void stopProvisioningMode() {
+  if (!provisioningMode) return;
+
+  WiFi.softAPdisconnect(true);
+  provisioningMode = false;
+  Serial.println("[SETUP] Provisioning stopped");
+}
+
+void ensureLocalServer() {
+  if (localServerStarted) return;
+  provisioningServer.on("/", HTTP_GET, handleProvisioningInfo);
+  provisioningServer.on("/status", HTTP_GET, handleProvisioningInfo);
+  provisioningServer.on("/wifi", HTTP_OPTIONS, handleProvisioningOptions);
+  provisioningServer.on("/wifi", HTTP_POST, handleProvisionWifi);
+  provisioningServer.on("/wifi/scan", HTTP_OPTIONS, handleProvisioningOptions);
+  provisioningServer.on("/wifi/scan", HTTP_GET, handleWifiScan);
+  provisioningServer.begin();
+  localServerStarted = true;
+  Serial.println("[LOCAL] HTTP server started on port 80");
+}
+
+void startProvisioningMode() {
+  currentState = PROVISIONING;
+  provisioningMode = true;
+
+  WiFi.disconnect(true);
+  delay(300);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(provisioningSsid().c_str(), provisioningPassword().c_str());
+  ensureLocalServer();
+
+  Serial.printf("[SETUP] AP SSID: %s\n", provisioningSsid().c_str());
+  Serial.printf("[SETUP] AP PASS: %s\n", provisioningPassword().c_str());
+  Serial.println("[SETUP] GET  http://192.168.4.1/wifi/scan to list nearby WiFi networks");
+  Serial.println("[SETUP] POST http://192.168.4.1/wifi with {\"ssid\":\"...\",\"password\":\"...\"}");
+  renderDisplay();
+}
+
+void applyProvisionedWifi() {
+  shouldApplyProvisionedWifi = false;
+  String nextSsid = pendingWifiSsid;
+  String nextPassword = pendingWifiPass;
+  pendingWifiSsid = "";
+  pendingWifiPass = "";
+
+  stopProvisioningMode();
+
+  if (connectToWifi(nextSsid, nextPassword, WIFI_CONNECT_TIMEOUT_MS)) {
+    saveWifiCredentials(nextSsid, nextPassword);
+    sendHeartbeat();
+    return;
+  }
+
+  startProvisioningMode();
 }
 
 bool sendHeartbeat() {
   if (WiFi.status() != WL_CONNECTED) return false;
 
-  String url = String(BACKEND_URL) + "/iot/heartbeat";
-  WiFiClient client;
+  WiFiClientSecure client;
   HTTPClient http;
+  client.setInsecure();
 
+  String url = String(CONFIG.backendUrl) + "/iot/heartbeat";
   if (!http.begin(client, url)) return false;
 
   http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-Device-Key", DEVICE_KEY);
+  http.addHeader("X-Device-Key", CONFIG.deviceKey);
   http.setTimeout(5000);
 
-  int code = http.POST("");
+  StaticJsonDocument<384> doc;
+  int batteryLevel = readBatteryLevel();
+  if (batteryLevel >= 0) doc["batteryLevel"] = batteryLevel;
+  doc["isCharging"] = false;
+  doc["wifiSsid"] = WiFi.SSID();
+  doc["wifiRssi"] = WiFi.RSSI();
+  doc["localIp"] = WiFi.localIP().toString();
+  doc["localPairingToken"] = localPairingToken;
+  doc["firmwareVersion"] = CONFIG.firmwareVersion;
+
+  String body;
+  serializeJson(doc, body);
+
+  int code = http.POST(body);
   http.end();
 
-  Serial.printf("[HB] Heartbeat %s (HTTP %d)\n", code == 200 ? "OK" : "FAIL", code);
-  return (code == 200);
+  Serial.printf("[HB] %s (HTTP %d)\n", code == 200 ? "OK" : "FAIL", code);
+  return code == 200;
 }
 
-// ==========================================
-// 6. BUTTON — 1 tombol 3 aksi
-// ==========================================
-static bool   lastBtnState        = HIGH;
-static unsigned long pressStart   = 0;
-static bool   longPressTriggered  = false;
-static unsigned long lastShortRelease = 0;
-static bool   pendingAssistance   = false;
+bool ackCommand(String commandId, const char* status, String message) {
+  if (WiFi.status() != WL_CONNECTED) return false;
 
-void handleButton() {
-  bool btn = digitalRead(BTN_PIN);
+  WiFiClientSecure client;
+  HTTPClient http;
+  client.setInsecure();
 
-  // --- Tombol baru ditekan ---
-  if (btn == LOW && lastBtnState == HIGH) {
-    pressStart          = millis();
-    longPressTriggered  = false;
-  }
+  String url = String(CONFIG.backendUrl) + "/iot/commands/" + commandId + "/ack";
+  if (!http.begin(client, url)) return false;
 
-  // --- Tombol sedang ditekan (cek long press) ---
-  if (btn == LOW && lastBtnState == LOW) {
-    if (!longPressTriggered && (millis() - pressStart >= LONG_PRESS_THRESHOLD)) {
-      longPressTriggered = true;
-      Serial.println("[BTN] EMERGENCY (long press)");
-      sendEventToBackend("emergency", "Tombol darurat ditekan");
-    }
-  }
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Device-Key", CONFIG.deviceKey);
+  http.setTimeout(5000);
 
-  // --- Tombol dilepas ---
-  if (btn == HIGH && lastBtnState == LOW) {
-    unsigned long duration = millis() - pressStart;
+  StaticJsonDocument<192> doc;
+  doc["status"] = status;
+  doc["message"] = message;
 
-    if (duration < 150UL) {
-      // Debounce — abaikan
-    } else if (!longPressTriggered && duration < 1500UL) {
-      // Short press: cek apakah double click
-      if (lastShortRelease > 0 && (millis() - lastShortRelease) < DOUBLE_PRESS_WINDOW) {
-        // Double press → service_request
-        pendingAssistance = false;
-        lastShortRelease  = 0;
-        Serial.println("[BTN] Service request (double press)");
-        sendEventToBackend("service_request", "Permintaan layanan");
-      } else {
-        // Catat waktu release, tunggu konfirmasi double
-        lastShortRelease  = millis();
-        pendingAssistance = true;
-      }
-    }
-    // Long press sudah di-handle saat hold — tidak perlu aksi saat release
-  }
+  String body;
+  serializeJson(doc, body);
 
-  lastBtnState = btn;
+  int code = http.POST(body);
+  http.end();
+  Serial.printf("[CMD] Ack %s (HTTP %d)\n", status, code);
+  return code == 200;
 }
 
-// Cek pending single press (tunggu jendela double press berlalu)
-void checkPendingAssistance() {
-  if (pendingAssistance && lastShortRelease > 0 &&
-      (millis() - lastShortRelease) > DOUBLE_PRESS_WINDOW) {
-    pendingAssistance = false;
-    lastShortRelease  = 0;
-    Serial.println("[BTN] Assistance request (short press)");
-    sendEventToBackend("assistance_request", "Permintaan bantuan");
-  }
-}
+void handleConfigureWifi(JsonObject command) {
+  String commandId = command["id"] | "";
+  String nextSsid = command["payload"]["ssid"] | "";
+  String nextPassword = command["payload"]["password"] | "";
 
-// ==========================================
-// 7. DHT — Cek Anomali Sensor
-// ==========================================
-static unsigned long lastTempAnomalyTime = 0;
-static unsigned long lastHumAnomalyTime  = 0;
-
-void checkDHTAnomaly() {
-  float temp = dht.readTemperature();
-  float hum  = dht.readHumidity();
-
-  if (isnan(temp) || isnan(hum)) {
-    Serial.println("[DHT] Gagal baca sensor");
+  if (commandId.length() == 0 || nextSsid.length() == 0) {
+    if (commandId.length() > 0) ackCommand(commandId, "failed", "Invalid WiFi command");
     return;
   }
 
-  Serial.printf("[DHT] Suhu: %.1f°C | Kelembaban: %.1f%%\n", temp, hum);
+  currentState = APPLYING_WIFI;
+  renderDisplay();
+  Serial.println("[CMD] Configure WiFi: " + nextSsid);
 
-  // Cek anomali suhu
-  if ((temp > TEMP_HIGH_THRESHOLD || temp < TEMP_LOW_THRESHOLD) &&
-      (millis() - lastTempAnomalyTime > DHT_ANOMALY_COOLDOWN)) {
-    lastTempAnomalyTime = millis();
-    String detail = "Suhu abnormal: " + String(temp, 1) + "C";
-    Serial.println("[DHT] ANOMALY: " + detail);
-    sendEventToBackend("sensor_anomaly", detail);
+  String previousSsid = activeWifiSsid;
+  String previousPassword = activeWifiPass;
+
+  if (connectToWifi(nextSsid, nextPassword, WIFI_CONNECT_TIMEOUT_MS)) {
+    saveWifiCredentials(nextSsid, nextPassword);
+    sendHeartbeat();
+    ackCommand(commandId, "applied", "WiFi connected");
+    return;
   }
 
-  // Cek anomali kelembaban
-  if (hum > HUM_HIGH_THRESHOLD &&
-      (millis() - lastHumAnomalyTime > DHT_ANOMALY_COOLDOWN)) {
-    lastHumAnomalyTime = millis();
-    String detail = "Kelembaban tinggi: " + String(hum, 1) + "%";
-    Serial.println("[DHT] ANOMALY: " + detail);
-    sendEventToBackend("sensor_anomaly", detail);
+  connectToWifi(previousSsid, previousPassword, WIFI_CONNECT_TIMEOUT_MS);
+  ackCommand(commandId, "failed", "WiFi connection failed");
+}
+
+void pollCommands() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  WiFiClientSecure client;
+  HTTPClient http;
+  client.setInsecure();
+
+  String url = String(CONFIG.backendUrl) + "/iot/commands";
+  if (!http.begin(client, url)) return;
+
+  http.addHeader("X-Device-Key", CONFIG.deviceKey);
+  http.setTimeout(5000);
+
+  int code = http.GET();
+  if (code == 200) {
+    String payload = http.getString();
+    StaticJsonDocument<1024> doc;
+    DeserializationError error = deserializeJson(doc, payload);
+
+    if (!error) {
+      JsonArray commands = doc["data"].as<JsonArray>();
+      for (JsonObject command : commands) {
+        String commandType = command["commandType"] | "";
+        if (commandType == "configure_wifi") {
+          handleConfigureWifi(command);
+        }
+      }
+    } else {
+      Serial.println("[CMD] JSON parse failed");
+    }
   }
+
+  http.end();
 }
 
-// ==========================================
-// 8. RENDER DISPLAY
-// ==========================================
-void renderDisplay() {
-  const unsigned char* img;
-  if      (currentState == SENDING) img = img_listen;
-  else if (currentState == SUCCESS)  img = img_speak;
-  else                               img = img_idle;   // IDLE & ERROR_STATE
-
-  tft.drawBitmap(0, 0, img, 480, 320, TFT_BLACK, TFT_WHITE);
-  drawVisualizer();
-}
-
-// ==========================================
-// 9. SETUP
-// ==========================================
 void setup() {
   Serial.begin(115200);
-  delay(2000);
-  Serial.printf("\n[SYS] --- %s ---\n", PRODUCT_NAME);
+  delay(1200);
+  Serial.printf("\n[SYS] --- %s ---\n", CONFIG.productName);
 
-  // TFT init (identik dengan ABot.ino)
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, HIGH);
   tft.init();
   tft.setRotation(3);
-  tft.fillScreen(TFT_WHITE);
   tft.invertDisplay(true);
-  Serial.println("[TFT] Ready");
+  renderDisplay();
 
-  // Button
-  pinMode(BTN_PIN, INPUT_PULLUP);
-
-  // DHT
-  dht.begin();
-  Serial.println("[DHT] Ready");
-
-  // WiFi
-  Serial.printf("[WIFI] Connecting to %s", WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  if (BATTERY_ADC_PIN >= 0) {
+    analogReadResolution(12);
+    pinMode(BATTERY_ADC_PIN, INPUT);
   }
-  Serial.printf("\n[WIFI] Connected: %s\n", WiFi.localIP().toString().c_str());
 
-  Serial.printf("[CFG] Backend: %s\n", BACKEND_URL);
-  Serial.printf("[CFG] Device Key: %.8s...\n", DEVICE_KEY);  // print 8 char pertama saja
+  Serial.printf("[CFG] Backend: %s\n", CONFIG.backendUrl);
+  Serial.printf("[CFG] Device Key: %.8s...\n", CONFIG.deviceKey);
 
-  // Kirim heartbeat pertama saat boot
-  sendHeartbeat();
+  preferences.begin(PREF_NAMESPACE, false);
+  loadWifiCredentials();
+  loadPairingToken();
 
-  Serial.println("[SYS] System Ready");
+  if (hasWifiCredentials() && connectToWifi(activeWifiSsid, activeWifiPass, WIFI_CONNECT_TIMEOUT_MS)) {
+    sendHeartbeat();
+  } else {
+    startProvisioningMode();
+  }
 }
 
-// ==========================================
-// 10. LOOP
-// ==========================================
 void loop() {
   unsigned long now = millis();
 
-  // --- Heartbeat timer ---
+  if (localServerStarted) {
+    provisioningServer.handleClient();
+  }
+
+  if (provisioningMode) {
+    if (shouldApplyProvisionedWifi) {
+      applyProvisionedWifi();
+    }
+    renderDisplay();
+    vTaskDelay(1);
+    return;
+  }
+
   static unsigned long lastHeartbeat = 0;
   if (now - lastHeartbeat > HEARTBEAT_INTERVAL_MS) {
     lastHeartbeat = now;
-    sendHeartbeat();
+    if (!sendHeartbeat()) {
+      currentState = ERROR_STATE;
+    }
   }
 
-  // --- DHT timer ---
-  static unsigned long lastDHT = 0;
-  if (now - lastDHT > DHT_INTERVAL_MS) {
-    lastDHT = now;
-    checkDHTAnomaly();
+  static unsigned long lastCommandPoll = 0;
+  if (now - lastCommandPoll > COMMAND_POLL_INTERVAL_MS) {
+    lastCommandPoll = now;
+    pollCommands();
   }
 
-  // --- Auto-reset SUCCESS/ERROR ke IDLE ---
-  if ((currentState == SUCCESS || currentState == ERROR_STATE) &&
-      (now - stateChangeTime > SUCCESS_DISPLAY_MS)) {
-    setState(IDLE);
-  }
-
-  // --- Button handling ---
-  handleButton();
-  checkPendingAssistance();
-
-  // --- Render display ---
   renderDisplay();
-
-  vTaskDelay(1);  // beri waktu watchdog
+  vTaskDelay(1);
 }
