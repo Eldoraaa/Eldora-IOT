@@ -640,6 +640,12 @@ void setup() {
   Serial.printf("[CFG] Device Key: %.8s...\n", CONFIG.deviceKey);
 
   preferences.begin(PREF_NAMESPACE, false);
+
+  // Clear Preference
+  preferences.clear(); 
+  Serial.println("[SYS] FACTORY RESET BERHASIL!");
+  // -------------------------------------
+
   loadWifiCredentials();
   loadPairingToken();
 
