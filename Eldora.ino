@@ -21,12 +21,14 @@
 #define ELDORA_PRODUCT_NAME "ELDORA_CARE"
 #define ELDORA_BACKEND_URL "https://eldora-backend-production.up.railway.app"
 #define ELDORA_DEVICE_KEY "ELDORA-HUB-001"
+#define ELDORA_PROVISIONING_SECRET "bZdarnuQqe6EpTftziZaCeNgGR4phm0984V_nF1w0tk"
 #define ELDORA_FIRMWARE_VERSION "0.4.1"
 
 struct EldoraConfig {
   const char* productName;
   const char* backendUrl;
   const char* deviceKey;
+  const char* provisioningSecret;
   const char* firmwareVersion;
 };
 
@@ -34,6 +36,7 @@ const EldoraConfig CONFIG = {
   ELDORA_PRODUCT_NAME,
   ELDORA_BACKEND_URL,
   ELDORA_DEVICE_KEY,
+  ELDORA_PROVISIONING_SECRET,
   ELDORA_FIRMWARE_VERSION,
 };
 
@@ -289,6 +292,13 @@ void startMdns() {
 
 void ensureLocalServer();
 
+void addDeviceHeaders(HTTPClient& http) {
+  http.addHeader("X-Device-Key", CONFIG.deviceKey);
+  if (CONFIG.provisioningSecret[0] != '\0') {
+    http.addHeader("X-Device-Provisioning-Secret", CONFIG.provisioningSecret);
+  }
+}
+
 bool connectToWifi(String ssid, String password, unsigned long timeoutMs) {
   if (ssid.length() == 0) {
     Serial.println("[WIFI] SSID is empty");
@@ -506,7 +516,7 @@ bool sendHeartbeat() {
   if (!http.begin(client, url)) return false;
 
   http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-Device-Key", CONFIG.deviceKey);
+  addDeviceHeaders(http);
   http.setTimeout(5000);
 
   StaticJsonDocument<384> doc;
@@ -540,7 +550,7 @@ bool ackCommand(String commandId, const char* status, String message) {
   if (!http.begin(client, url)) return false;
 
   http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-Device-Key", CONFIG.deviceKey);
+  addDeviceHeaders(http);
   http.setTimeout(5000);
 
   StaticJsonDocument<192> doc;
@@ -594,7 +604,7 @@ void pollCommands() {
   String url = String(CONFIG.backendUrl) + "/iot/commands";
   if (!http.begin(client, url)) return;
 
-  http.addHeader("X-Device-Key", CONFIG.deviceKey);
+  addDeviceHeaders(http);
   http.setTimeout(5000);
 
   int code = http.GET();
@@ -640,11 +650,6 @@ void setup() {
   Serial.printf("[CFG] Device Key: %.8s...\n", CONFIG.deviceKey);
 
   preferences.begin(PREF_NAMESPACE, false);
-
-  // Clear Preference
-  preferences.clear(); 
-  Serial.println("[SYS] FACTORY RESET BERHASIL!");
-  // -------------------------------------
 
   loadWifiCredentials();
   loadPairingToken();
