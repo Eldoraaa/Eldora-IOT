@@ -8,6 +8,12 @@
 #include <Preferences.h>
 #include <esp_system.h>
 #include <LovyanGFX.hpp>
+#include <driver/i2s.h>
+#include "AudioFileSourceHTTPStream.h"
+#include "AudioFileSourcePROGMEM.h"
+#include "AudioFileSourceID3.h"
+#include "AudioGeneratorMP3.h"
+#include "AudioOutputI2S.h"
 #include "images_data.h"
 
 #ifndef ELDORA_FRAME_WIDTH
@@ -48,6 +54,18 @@ const EldoraConfig CONFIG = {
 #define TFT_RST 8
 #define TFT_BL 14
 
+// Audio pins.
+#define MIC_SCK 41
+#define MIC_WS 42
+#define MIC_SD 2
+#define AMP_BCLK 16
+#define AMP_LRC 15
+#define AMP_DIN 17
+#define VOICE_BUTTON_PIN 1
+#define SAMPLE_RATE 16000
+#define REC_SECONDS 8
+#define SILENCE_THRESHOLD 700
+
 // Timers.
 #define HEARTBEAT_INTERVAL_MS 30000UL
 #define COMMAND_POLL_INTERVAL_MS 3000UL
@@ -65,7 +83,7 @@ const EldoraConfig CONFIG = {
 #define BATTERY_EMPTY_MV 3300
 #define BATTERY_FULL_MV 4200
 
-enum HubState { BOOTING, PROVISIONING, WIFI_CONNECTING, ONLINE, APPLYING_WIFI, ERROR_STATE };
+enum HubState { BOOTING, PROVISIONING, WIFI_CONNECTING, ONLINE, APPLYING_WIFI, LISTENING, THINKING, SPEAKING, ERROR_STATE };
 HubState currentState = BOOTING;
 
 class LGFX_ESP32S3 : public lgfx::LGFX_Device {
@@ -104,6 +122,12 @@ String activeWifiPass;
 String pendingWifiSsid;
 String pendingWifiPass;
 String localPairingToken;
+uint8_t* audioBuffer = nullptr;
+size_t audioBufferSize = SAMPLE_RATE * 2 * REC_SECONDS;
+size_t currentAudioSize = 0;
+volatile int16_t micVolume = 0;
+AudioGeneratorMP3* mp3 = nullptr;
+AudioOutputI2S* audioOut = nullptr;
 bool provisioningMode = false;
 bool shouldApplyProvisionedWifi = false;
 bool localServerStarted = false;
@@ -171,6 +195,12 @@ const char* stateLabel() {
       return "Online";
     case APPLYING_WIFI:
       return "WiFi Setup";
+    case LISTENING:
+      return "Listening";
+    case THINKING:
+      return "Thinking";
+    case SPEAKING:
+      return "Speaking";
     case ERROR_STATE:
       return "Needs Check";
     default:
@@ -186,6 +216,12 @@ uint16_t stateColor() {
       return lgfx::color565(123, 167, 212);
     case APPLYING_WIFI:
       return lgfx::color565(90, 150, 230);
+    case LISTENING:
+      return lgfx::color565(90, 150, 230);
+    case THINKING:
+      return lgfx::color565(214, 158, 46);
+    case SPEAKING:
+      return lgfx::color565(80, 190, 135);
     case ERROR_STATE:
       return lgfx::color565(235, 95, 95);
     default:
@@ -194,8 +230,8 @@ uint16_t stateColor() {
 }
 
 const uint8_t* currentFrame() {
-  if (currentState == ONLINE) return img_speak;
-  if (currentState == PROVISIONING || currentState == WIFI_CONNECTING || currentState == APPLYING_WIFI) return img_listen;
+  if (currentState == SPEAKING || currentState == ONLINE) return img_speak;
+  if (currentState == PROVISIONING || currentState == WIFI_CONNECTING || currentState == APPLYING_WIFI || currentState == LISTENING || currentState == THINKING) return img_listen;
   return img_idle;
 }
 
@@ -291,11 +327,191 @@ void startMdns() {
 }
 
 void ensureLocalServer();
+void showCoreMessage(const String& title, const String& message);
 
 void addDeviceHeaders(HTTPClient& http) {
   http.addHeader("X-Device-Key", CONFIG.deviceKey);
   if (CONFIG.provisioningSecret[0] != '\0') {
     http.addHeader("X-Device-Provisioning-Secret", CONFIG.provisioningSecret);
+  }
+}
+
+void setupAudioHardware() {
+  i2s_config_t micConfig = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 512
+  };
+  i2s_pin_config_t micPins = {
+    .bck_io_num = MIC_SCK,
+    .ws_io_num = MIC_WS,
+    .data_out_num = -1,
+    .data_in_num = MIC_SD
+  };
+  i2s_driver_install(I2S_NUM_0, &micConfig, 0, NULL);
+  i2s_set_pin(I2S_NUM_0, &micPins);
+
+  audioOut = new AudioOutputI2S(1);
+  audioOut->SetPinout(AMP_BCLK, AMP_LRC, AMP_DIN);
+  audioOut->SetGain(1.0);
+  mp3 = new AudioGeneratorMP3();
+  Serial.println("[AUDIO] Mic and speaker ready");
+}
+
+void playMP3FromURL(String url) {
+  if (!mp3 || !audioOut || url.length() == 0) return;
+
+  WiFiClientSecure client;
+  HTTPClient http;
+  client.setInsecure();
+
+  if (!http.begin(client, url)) return;
+  http.addHeader("User-Agent", "Eldora-Core");
+  int code = http.GET();
+  if (code != 200) {
+    Serial.printf("[AUDIO] MP3 download failed HTTP %d\n", code);
+    http.end();
+    return;
+  }
+
+  int len = http.getSize();
+  if (len <= 0) {
+    http.end();
+    return;
+  }
+
+  uint8_t* mp3Buffer = (uint8_t*)ps_malloc(len);
+  if (!mp3Buffer) {
+    http.end();
+    return;
+  }
+
+  WiFiClient* stream = http.getStreamPtr();
+  int bytesRead = 0;
+  while (http.connected() && bytesRead < len) {
+    if (stream->available()) {
+      bytesRead += stream->readBytes(&mp3Buffer[bytesRead], len - bytesRead);
+    }
+    delay(1);
+  }
+  http.end();
+
+  AudioFileSourcePROGMEM* memSource = new AudioFileSourcePROGMEM(mp3Buffer, len);
+  AudioFileSourceID3* id3 = new AudioFileSourceID3(memSource);
+  currentState = SPEAKING;
+  renderDisplay();
+
+  i2s_stop(I2S_NUM_0);
+  if (mp3->begin(id3, audioOut)) {
+    while (mp3->isRunning()) {
+      if (!mp3->loop()) mp3->stop();
+      delay(1);
+    }
+  }
+  i2s_start(I2S_NUM_0);
+
+  delete id3;
+  delete memSource;
+  free(mp3Buffer);
+  currentState = LISTENING;
+  renderDisplay();
+}
+
+void sendVoiceAudio() {
+  if (WiFi.status() != WL_CONNECTED || currentAudioSize < 2000) {
+    currentAudioSize = 0;
+    currentState = WiFi.status() == WL_CONNECTED ? LISTENING : ERROR_STATE;
+    renderDisplay();
+    return;
+  }
+
+  currentState = THINKING;
+  renderDisplay();
+
+  WiFiClientSecure client;
+  HTTPClient http;
+  client.setInsecure();
+
+  String url = String(CONFIG.backendUrl) + "/voice/device/process-audio";
+  if (!http.begin(client, url)) {
+    currentAudioSize = 0;
+    currentState = LISTENING;
+    renderDisplay();
+    return;
+  }
+
+  http.addHeader("Content-Type", "application/octet-stream");
+  addDeviceHeaders(http);
+  http.setTimeout(45000);
+
+  int code = http.POST(audioBuffer, currentAudioSize);
+  if (code == 200) {
+    String payload = http.getString();
+    StaticJsonDocument<768> doc;
+    if (!deserializeJson(doc, payload)) {
+      const char* audioUrl = doc["data"]["audioUrl"] | "";
+      const char* message = doc["data"]["message"] | "";
+      if (String(message).length() > 0) showCoreMessage("ELDORA", String(message));
+      if (String(audioUrl).length() > 0) playMP3FromURL(String(audioUrl));
+    }
+  } else {
+    Serial.printf("[VOICE] Audio failed HTTP %d\n", code);
+  }
+
+  http.end();
+  currentAudioSize = 0;
+  currentState = LISTENING;
+  renderDisplay();
+}
+
+void audioTask(void* pv) {
+  const int chunkSize = 512;
+  int32_t i2sRawBuffer[chunkSize];
+  size_t bytesRead;
+  uint32_t silenceSamples = 0;
+  bool speechStarted = false;
+
+  for (;;) {
+    if (currentState == LISTENING) {
+      esp_err_t result = i2s_read(I2S_NUM_0, i2sRawBuffer, sizeof(i2sRawBuffer), &bytesRead, portMAX_DELAY);
+      if (result == ESP_OK && bytesRead > 0) {
+        int samples = bytesRead / 4;
+        for (int i = 0; i < samples; i++) {
+          int16_t pcmSample = (int16_t)(i2sRawBuffer[i] >> 16);
+          micVolume = abs(pcmSample);
+
+          if (!speechStarted && micVolume >= SILENCE_THRESHOLD) {
+            speechStarted = true;
+            currentAudioSize = 0;
+            silenceSamples = 0;
+          }
+
+          if (speechStarted && currentAudioSize < audioBufferSize - 2) {
+            memcpy(&audioBuffer[currentAudioSize], &pcmSample, 2);
+            currentAudioSize += 2;
+          }
+
+          if (speechStarted) {
+            silenceSamples = micVolume < SILENCE_THRESHOLD ? silenceSamples + 1 : 0;
+          }
+        }
+
+        if (speechStarted && (currentAudioSize >= audioBufferSize - 2 || silenceSamples > SAMPLE_RATE * 2)) {
+          speechStarted = false;
+          sendVoiceAudio();
+          silenceSamples = 0;
+        }
+      }
+    } else {
+      delay(100);
+      silenceSamples = 0;
+      speechStarted = false;
+    }
   }
 }
 
@@ -669,6 +885,7 @@ void setup() {
 
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, HIGH);
+  pinMode(VOICE_BUTTON_PIN, INPUT_PULLUP);
   tft.init();
   tft.setRotation(3);
   tft.invertDisplay(true);
@@ -683,6 +900,14 @@ void setup() {
   Serial.printf("[CFG] Device Key: %.8s...\n", CONFIG.deviceKey);
 
   preferences.begin(PREF_NAMESPACE, false);
+
+  audioBuffer = (uint8_t*)ps_malloc(audioBufferSize);
+  if (audioBuffer) {
+    setupAudioHardware();
+    xTaskCreatePinnedToCore(audioTask, "Audio", 10000, NULL, 1, NULL, 0);
+  } else {
+    Serial.println("[AUDIO] PSRAM allocation failed");
+  }
 
   loadWifiCredentials();
   loadPairingToken();
@@ -708,6 +933,10 @@ void loop() {
     renderDisplay();
     vTaskDelay(1);
     return;
+  }
+
+  if (currentState == ONLINE && audioBuffer) {
+    currentState = LISTENING;
   }
 
   static unsigned long lastHeartbeat = 0;
