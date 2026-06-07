@@ -67,6 +67,12 @@ const EldoraConfig CONFIG = {
 #define SAMPLE_RATE 16000
 #define REC_SECONDS 8
 #define SILENCE_THRESHOLD 700
+#define VOICE_START_SAMPLES (SAMPLE_RATE / 20)
+#define VOICE_END_SILENCE_SAMPLES SAMPLE_RATE
+#define VOICE_MIN_SPEECH_SAMPLES (SAMPLE_RATE / 4)
+#define VOICE_MIN_RECORD_BYTES SAMPLE_RATE
+#define VOICE_FEEDBACK_COOLDOWN_MS 2500UL
+#define VOICE_NOISE_COOLDOWN_MS 800UL
 
 // Timers.
 #define HEARTBEAT_INTERVAL_MS 30000UL
@@ -137,6 +143,7 @@ bool provisioningMode = false;
 bool shouldApplyProvisionedWifi = false;
 bool localServerStarted = false;
 bool mdnsStarted = false;
+unsigned long voiceCooldownUntil = 0;
 
 String compactDeviceCode() {
   String code = CONFIG.deviceKey;
@@ -338,7 +345,12 @@ void startMdns() {
 void ensureLocalServer();
 void showCoreMessage(const String& title, const String& message);
 
+bool canAutoListen() {
+  return WiFi.status() == WL_CONNECTED && millis() >= voiceCooldownUntil && currentState == LISTENING;
+}
+
 void addDeviceHeaders(HTTPClient& http) {
+
   http.addHeader("X-Device-Key", CONFIG.deviceKey);
   if (CONFIG.provisioningSecret[0] != '\0') {
     http.addHeader("X-Device-Provisioning-Secret", CONFIG.provisioningSecret);
@@ -427,14 +439,16 @@ void playMP3FromURL(String url) {
   delete id3;
   delete memSource;
   free(mp3Buffer);
-  currentState = LISTENING;
+  voiceCooldownUntil = millis() + VOICE_FEEDBACK_COOLDOWN_MS;
+  currentState = ONLINE;
   renderDisplay();
 }
 
 void sendVoiceAudio() {
-  if (WiFi.status() != WL_CONNECTED || currentAudioSize < 2000) {
+  if (WiFi.status() != WL_CONNECTED || currentAudioSize < VOICE_MIN_RECORD_BYTES) {
     currentAudioSize = 0;
-    currentState = WiFi.status() == WL_CONNECTED ? LISTENING : ERROR_STATE;
+    voiceCooldownUntil = millis() + VOICE_NOISE_COOLDOWN_MS;
+    currentState = WiFi.status() == WL_CONNECTED ? ONLINE : ERROR_STATE;
     renderDisplay();
     return;
   }
@@ -449,7 +463,8 @@ void sendVoiceAudio() {
   String url = String(CONFIG.backendUrl) + "/voice/device/process-audio";
   if (!http.begin(client, url)) {
     currentAudioSize = 0;
-    currentState = LISTENING;
+    voiceCooldownUntil = millis() + VOICE_NOISE_COOLDOWN_MS;
+    currentState = ONLINE;
     renderDisplay();
     return;
   }
@@ -474,7 +489,10 @@ void sendVoiceAudio() {
 
   http.end();
   currentAudioSize = 0;
-  currentState = LISTENING;
+  if (currentState != ONLINE) {
+    voiceCooldownUntil = millis() + VOICE_NOISE_COOLDOWN_MS;
+    currentState = ONLINE;
+  }
   renderDisplay();
 }
 
@@ -482,11 +500,13 @@ void audioTask(void* pv) {
   const int chunkSize = 512;
   int32_t i2sRawBuffer[chunkSize];
   size_t bytesRead;
+  uint32_t loudSamples = 0;
   uint32_t silenceSamples = 0;
+  uint32_t recordedSamples = 0;
   bool speechStarted = false;
 
   for (;;) {
-    if (currentState == LISTENING) {
+    if (canAutoListen()) {
       esp_err_t result = i2s_read(I2S_NUM_0, i2sRawBuffer, sizeof(i2sRawBuffer), &bytesRead, portMAX_DELAY);
       if (result == ESP_OK && bytesRead > 0) {
         int samples = bytesRead / 4;
@@ -494,31 +514,51 @@ void audioTask(void* pv) {
           int16_t pcmSample = (int16_t)(i2sRawBuffer[i] >> 16);
           micVolume = abs(pcmSample);
 
-          if (!speechStarted && micVolume >= SILENCE_THRESHOLD) {
-            speechStarted = true;
-            currentAudioSize = 0;
-            silenceSamples = 0;
-          }
+          if (!speechStarted) {
+            if (micVolume >= SILENCE_THRESHOLD) {
+              loudSamples++;
+            } else if (loudSamples > 0) {
+              loudSamples--;
+            }
 
-          if (speechStarted && currentAudioSize < audioBufferSize - 2) {
-            memcpy(&audioBuffer[currentAudioSize], &pcmSample, 2);
-            currentAudioSize += 2;
+            if (loudSamples >= VOICE_START_SAMPLES) {
+              speechStarted = true;
+              currentAudioSize = 0;
+              silenceSamples = 0;
+              recordedSamples = 0;
+            }
           }
 
           if (speechStarted) {
+            if (currentAudioSize < audioBufferSize - 2) {
+              memcpy(&audioBuffer[currentAudioSize], &pcmSample, 2);
+              currentAudioSize += 2;
+              recordedSamples++;
+            }
             silenceSamples = micVolume < SILENCE_THRESHOLD ? silenceSamples + 1 : 0;
           }
         }
 
-        if (speechStarted && (currentAudioSize >= audioBufferSize - 2 || silenceSamples > SAMPLE_RATE * 2)) {
+        if (speechStarted && (currentAudioSize >= audioBufferSize - 2 || silenceSamples > VOICE_END_SILENCE_SAMPLES)) {
           speechStarted = false;
-          sendVoiceAudio();
+          if (recordedSamples >= VOICE_MIN_SPEECH_SAMPLES) {
+            sendVoiceAudio();
+          } else {
+            currentAudioSize = 0;
+            voiceCooldownUntil = millis() + VOICE_NOISE_COOLDOWN_MS;
+            currentState = ONLINE;
+            renderDisplay();
+          }
+          loudSamples = 0;
           silenceSamples = 0;
+          recordedSamples = 0;
         }
       }
     } else {
       delay(100);
+      loudSamples = 0;
       silenceSamples = 0;
+      recordedSamples = 0;
       speechStarted = false;
     }
   }
@@ -853,7 +893,7 @@ void handleConfigureWifi(JsonObject command) {
 }
 
 void pollCommands() {
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.status() != WL_CONNECTED || currentState == THINKING || currentState == SPEAKING) return;
 
   WiFiClientSecure client;
   HTTPClient http;
@@ -952,7 +992,7 @@ void loop() {
     return;
   }
 
-  if (currentState == ONLINE && audioBuffer) {
+  if (currentState == ONLINE && audioBuffer && WiFi.status() == WL_CONNECTED && millis() >= voiceCooldownUntil) {
     currentState = LISTENING;
   }
 
