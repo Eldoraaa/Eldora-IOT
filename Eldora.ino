@@ -850,12 +850,18 @@ void showCoreMessage(const String& title, const String& message) {
   Serial.println("[VOICE] " + title + ": " + message);
 }
 
-void handleSpeakOnCore(JsonObject command) {
+void handleSpeakOnDoraBot(JsonObject command) {
   String commandId = command["id"] | "";
   String message = command["payload"]["message"] | "Eldora is here. Are you feeling okay?";
+  String audioUrl = command["payload"]["audioUrl"] | "";
   if (message.length() == 0) message = "Eldora is here. Are you feeling okay?";
   showCoreMessage("ELDORA CHECK-IN", message);
-  if (commandId.length() > 0) ackCommand(commandId, "applied", "Message displayed on Eldora Core");
+  if (audioUrl.length() > 0) {
+    playMP3FromURL(audioUrl);
+    if (commandId.length() > 0) ackCommand(commandId, "applied", "Voice played on DoraBot");
+    return;
+  }
+  if (commandId.length() > 0) ackCommand(commandId, "failed", "Missing voice audio URL");
 }
 
 void handleLocalAlarm(JsonObject command) {
@@ -917,8 +923,8 @@ void pollCommands() {
         String commandType = command["commandType"] | "";
         if (commandType == "configure_wifi") {
           handleConfigureWifi(command);
-        } else if (commandType == "speak_on_core") {
-          handleSpeakOnCore(command);
+        } else if (commandType == "speak_on_dorabot" || commandType == "speak_on_core") {
+          handleSpeakOnDoraBot(command);
         } else if (commandType == "activate_local_alarm") {
           handleLocalAlarm(command);
         }
