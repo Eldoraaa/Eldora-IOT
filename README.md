@@ -351,5 +351,5 @@ Have questions, want to collaborate, or interested in ELDORA?
 [![BINUS](https://img.shields.io/badge/BINUS%20University-BM%20Team-E7352C?style=for-the-badge)](https://binus.ac.id/)
 
 <br/>
-Made with 🤍 by **BINUS BM Team** 🔥
+Made with 🤍 by BINUS BM Team 🔥
 </div>
