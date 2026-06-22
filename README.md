@@ -15,7 +15,7 @@
 
 **ESP32-S3 firmware for the ELDORA DoraBot — the AI-powered home companion device for elderly safety, handling Wi-Fi provisioning, voice capture & playback, LCD status display, and real-time backend communication.**
 
-[🌐 ELDORA Ecosystem](https://github.com/eldora-bm) · [📱 Mobile App](https://github.com/eldora-bm/eldora-app) · [🧠 AI Backend](https://github.com/eldora-bm/eldora-backend)
+[🌐 ELDORA Ecosystem](https://github.com/Eldoraaa) · [📱 Mobile App](https://github.com/Eldoraaa/eldora-mobile) · [🧠 AI Backend](https://github.com/Eldoraaa/eldora-backend)
 
 </div>
 
@@ -201,7 +201,7 @@ Install the following via Arduino Library Manager (`Sketch → Include Library �
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/eldora-bm/dorabot.git
+git clone https://github.com/Eldoraaa/dorabot.git
 cd dorabot
 
 # 2. Open Eldora.ino in Arduino IDE
