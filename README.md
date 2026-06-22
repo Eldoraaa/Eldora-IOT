@@ -51,21 +51,7 @@ ELDORA Ecosystem
 └── 📱  ELDORA App    — Caregiver dashboard (XGBoost + SHAP, Isolation Forest)
 ```
 
-```mermaid
-flowchart LR
-    A[👴 Elderly User] -->|Voice| B[🤖 DoraBot\nESP32-S3]
-    B -->|Audio Upload| C[☁️ ELDORA Backend]
-    C -->|AI Response URL| B
-    B -->|Playback| A
-    C -->|Alerts & Insights| D[📱 ELDORA App]
-    D -->|Caregiver Messages| C
-    C -->|LCD Push| B
-
-    style A fill:#f0fdf4,stroke:#86efac
-    style B fill:#eff6ff,stroke:#93c5fd
-    style C fill:#fef3c7,stroke:#fcd34d
-    style D fill:#fdf2f8,stroke:#f0abfc
-```
+<img src="./images/dorabot-flowchart.png"/>
 
 ---
 
@@ -152,25 +138,7 @@ DoraBot/
 
 ## ⚙️ How DoraBot Works
 
-```mermaid
-sequenceDiagram
-    participant U as 👴 User
-    participant D as 🤖 DoraBot
-    participant B as ☁️ Backend
-    participant C as 📱 Caregiver App
-
-    D->>B: Heartbeat ping (every N seconds)
-    U->>D: Speaks to DoraBot
-    D->>D: Capture audio via INMP441 (I2S)
-    D->>B: Upload audio file
-    B->>B: AI processes speech (Qwen2 + Whisper)
-    B-->>D: Return audio response URL
-    D->>D: Fetch & decode audio URL
-    D->>U: Play response via MAX98357 speaker
-    C->>B: Caregiver sends LCD message
-    B-->>D: Message received via polling
-    D->>D: Render message on 3.5" LCD
-```
+<img src="./images/dorabot-sequence.png"/>
 
 **In plain English:**
 ```
