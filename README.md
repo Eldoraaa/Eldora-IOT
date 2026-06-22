@@ -1,8 +1,8 @@
-# IoT Eldora
+# DoraBot
 
-Arduino firmware for Eldora devices.
+ESP32-S3 firmware for Eldora DoraBot, the home companion device that handles Wi-Fi provisioning, pairing, voice capture, voice playback, LCD status, heartbeat, and backend command polling.
 
-## DoraBot hardware
+## Hardware
 - ESP32-S3
 - MAX98357 I2S amplifier
 - Speaker
@@ -11,31 +11,27 @@ Arduino firmware for Eldora devices.
 - Step-up + charger module
 - Li-ion battery
 
-## Fall detection hardware
-- ESP32-C3
-- MPU6050
-- MAX30102
-- Step-up + charger module
-- Li-ion battery
-
 ## Firmware features
-- WiFi provisioning via local setup AP
-- Local pairing token for mobile pairing
-- Backend heartbeat and command polling
-- DoraBot voice capture/playback
-- LCD status display
-- WiFi command apply flow
+- Local setup AP for Wi-Fi provisioning
+- Mobile pairing token flow
+- Backend heartbeat reporting
+- Backend command polling
+- DoraBot voice capture upload
+- DoraBot voice playback from backend audio URLs
+- LCD status and caregiver messages
+- Wi-Fi scan/apply flow
+- Battery and signal telemetry
 
 ## Configure
-Update the constants in `Eldora.ino` before flashing:
+Update constants in `Eldora.ino` before flashing:
 - backend URL
 - device key
 - provisioning secret
 - firmware version
 - hardware pins if wiring changes
 
-## Build/flash
-Open `Eldora.ino` in Arduino IDE, select the target ESP32 board, install required libraries, then upload.
+## Build / flash
+Open `Eldora.ino` in Arduino IDE, select the ESP32-S3 target board, install required libraries, then upload.
 
 ## Libraries
 - WiFi / HTTPClient / WebServer / ESPmDNS
